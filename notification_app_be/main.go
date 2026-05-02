@@ -1,485 +1,584 @@
 package main
 
 import (
-	"bytes"
-	"crypto/tls"
-	"encoding/json"
-	"io"
-	"log"
-	"net/http"
-	"sync"
-	"time"
+"bytes"
+"crypto/tls"
+"encoding/json"
+"io"
+"log"
+"net/http"
+"sync"
+"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
+"github.com/gin-gonic/gin"
+"github.com/google/uuid"
+
 )
 
+// might move these to env later.
+// keeping hardcoded while testing locally.
 const (
-	baseURL    = "http://20.207.122.201/evaluation-service"
-	plannerURL = "http://localhost:8081/plan"
+apiBase = "http://20.207.122.201/evaluation-service"
+planApi = "http://localhost:8081/plan"
 )
 
-// ---------------- GLOBALS ----------------
+// ---------------------------------------------------
+// globals
+// ---------------------------------------------------
 
 var (
-	bearerToken  string
-	tokenMu      sync.RWMutex
-	notifications []Notification
-	notifMu      sync.RWMutex
+tokenValue string
+tokenLock sync.RWMutex
+
+allNotifications []Notification
+notifLock         sync.RWMutex
+
 )
 
-// ---------------- TOKEN HELPERS ----------------
+// ---------------------------------------------------
+// token helpers
+// ---------------------------------------------------
 
-func getToken() string {
-	tokenMu.RLock()
-	defer tokenMu.RUnlock()
-	return bearerToken
+func fetchToken() string {
+
+tokenLock.RLock()
+defer tokenLock.RUnlock()
+
+return tokenValue
+
 }
 
-func setToken(t string) {
-	tokenMu.Lock()
-	defer tokenMu.Unlock()
-	bearerToken = t
+func updateToken(t string) {
+
+tokenLock.Lock()
+tokenValue = t
+tokenLock.Unlock()
+
 }
 
-// ---------------- STRUCTS ----------------
+// ---------------------------------------------------
+// models
+// ---------------------------------------------------
 
-type AuthRequest struct {
-	Email        string `json:"email"`
-	Name         string `json:"name"`
-	RollNo       string `json:"rollNo"`
-	AccessCode   string `json:"accessCode"`
-	ClientID     string `json:"clientID"`
-	ClientSecret string `json:"clientSecret"`
+type AuthReq struct {
+Email string json:"email"
+Name string json:"name"
+
+RollNo string `json:"rollNo"`
+
+AccessCode string `json:"accessCode"`
+
+ClientID     string `json:"clientID"`
+ClientSecret string `json:"clientSecret"`
+
 }
 
-type AuthResponse struct {
-	TokenType   string `json:"token_type"`
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int    `json:"expires_in"`
+type AuthResp struct {
+TokenType string json:"token_type"
+
+Token string `json:"access_token"`
+
+Expires int `json:"expires_in"`
+
 }
 
-type LogPayload struct {
-	Stack   string `json:"stack"`
-	Level   string `json:"level"`
-	Package string `json:"package"`
-	Message string `json:"message"`
+type LogReq struct {
+Stack string json:"stack"
+Level string json:"level"
+
+Package string `json:"package"`
+Message string `json:"message"`
+
 }
 
-// FINAL NOTIFICATION FORMAT
+// final response format
 type Notification struct {
-	ID        string `json:"ID"`
-	Type      string `json:"Type"`
-	Message   string `json:"Message"`
-	Timestamp string `json:"Timestamp"`
+ID string json:"ID"
+
+Type string `json:"Type"`
+
+Message string `json:"Message"`
+
+Timestamp string `json:"Timestamp"`
+
 }
 
-// Planner Response
+// planner side structs
 
-type SelectedVehicle struct {
-	ID                     string `json:"id"`
-	ServiceDurationInHours int    `json:"serviceDurationInHours"`
-	OperationalImpactScore int    `json:"operationalImpactScore"`
+type Vehicle struct {
+ID string json:"id"
+
+ServiceDuration int `json:"serviceDurationInHours"`
+
+ImpactScore int `json:"operationalImpactScore"`
+
 }
 
-type DepotResult struct {
-	DepotID             string            `json:"depotId"`
-	MechanicHoursBudget int               `json:"mechanicHoursBudget"`
-	TotalHoursUsed      int               `json:"totalHoursUsed"`
-	MaxImpactScore      int               `json:"maxImpactScore"`
-	SelectedVehicles    []SelectedVehicle `json:"selectedVehicles"`
+type DepotData struct {
+DepotID string json:"depotId"
+
+MechanicHours int `json:"mechanicHoursBudget"`
+
+TotalHours int `json:"totalHoursUsed"`
+
+MaxScore int `json:"maxImpactScore"`
+
+Selected []Vehicle `json:"selectedVehicles"`
+
 }
 
-type PlanResponse struct {
-	Results []DepotResult `json:"results"`
+type PlannerResp struct {
+Results []DepotData json:"results"
 }
 
-// ---------------- HTTP CLIENT ----------------
+// ---------------------------------------------------
+// http client
+// ---------------------------------------------------
 
-var httpClient = &http.Client{
-	Timeout: 20 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
+var apiClient = &http.Client{
+Timeout: 20 * time.Second,
+
+Transport: &http.Transport{
+	TLSClientConfig: &tls.Config{
+
+		// NOTE:
+		// cert issue happened once during local setup
+		// revisit later maybe
+		InsecureSkipVerify: true,
 	},
+},
+
 }
 
-// ---------------- MIDDLEWARE ----------------
+// ---------------------------------------------------
+// middleware stuff
+// ---------------------------------------------------
 
-type bodyLogWriter struct {
-	gin.ResponseWriter
-	body *bytes.Buffer
+type responseLogger struct {
+gin.ResponseWriter
+body *bytes.Buffer
 }
 
-func (w *bodyLogWriter) Write(b []byte) (int, error) {
-	w.body.Write(b)
-	return w.ResponseWriter.Write(b)
+func (w *responseLogger) Write(data []byte) (int, error) {
+
+w.body.Write(data)
+
+return w.ResponseWriter.Write(data)
+
 }
 
-func LoggingMiddleware() gin.HandlerFunc {
+func RequestLogger() gin.HandlerFunc {
 
-	return func(c *gin.Context) {
+return func(ctx *gin.Context) {
 
-		start := time.Now()
+	start := time.Now()
 
-		bodyBytes, _ := io.ReadAll(c.Request.Body)
+	bodyBytes, _ := io.ReadAll(ctx.Request.Body)
 
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	ctx.Request.Body = io.NopCloser(
+		bytes.NewBuffer(bodyBytes),
+	)
 
-		log.Printf("REQUEST: %s %s",
-			c.Request.Method,
-			c.Request.URL.Path,
+	log.Println("-------------")
+	log.Printf(
+		"%s %s",
+		ctx.Request.Method,
+		ctx.Request.URL.Path,
+	)
+
+	if len(bodyBytes) > 0 {
+		log.Println("body:", string(bodyBytes))
+	}
+
+	writer := &responseLogger{
+		body:           bytes.NewBufferString(""),
+		ResponseWriter: ctx.Writer,
+	}
+
+	ctx.Writer = writer
+
+	ctx.Next()
+
+	took := time.Since(start)
+
+	log.Printf("status=%d", ctx.Writer.Status())
+	log.Printf("took=%s", took)
+
+	log.Println("response:", writer.body.String())
+
+	if tok := fetchToken(); tok != "" {
+
+		// async because logging should not slow request
+		go sendLogs(
+			"backend",
+			"info",
+			"middleware",
+			"request finished",
 		)
-
-		log.Printf("BODY: %s", string(bodyBytes))
-
-		blw := &bodyLogWriter{
-			body:           bytes.NewBufferString(""),
-			ResponseWriter: c.Writer,
-		}
-
-		c.Writer = blw
-
-		c.Next()
-
-		duration := time.Since(start)
-
-		log.Printf("STATUS: %d", c.Writer.Status())
-		log.Printf("TIME: %s", duration)
-		log.Printf("RESPONSE: %s", blw.body.String())
-
-		if tok := getToken(); tok != "" {
-
-			go sendLog(
-				"backend",
-				"info",
-				"middleware",
-				"Request to "+c.Request.URL.Path+" completed",
-			)
-		}
 	}
 }
 
-// ---------------- HELPERS ----------------
+}
 
-func proxyRequest(
-	method string,
-	url string,
-	body []byte,
-	token string,
+// ---------------------------------------------------
+// generic api helper
+// ---------------------------------------------------
+
+func makeRequest(
+method string,
+url string,
+payload []byte,
+token string,
 ) (int, []byte, error) {
 
-	req, err := http.NewRequest(
-		method,
-		url,
-		bytes.NewBuffer(body),
-	)
+req, err := http.NewRequest(
+	method,
+	url,
+	bytes.NewBuffer(payload),
+)
 
-	if err != nil {
-		return 0, nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	if token != "" {
-		req.Header.Set(
-			"Authorization",
-			"Bearer "+token,
-		)
-	}
-
-	resp, err := httpClient.Do(req)
-
-	if err != nil {
-		return 0, nil, err
-	}
-
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-
-	return resp.StatusCode, respBody, nil
+if err != nil {
+	return 0, nil, err
 }
 
-func generateID() string {
-	return uuid.New().String()
-}
+req.Header.Set(
+	"Content-Type",
+	"application/json",
+)
 
-// ---------------- AUTH ----------------
-
-func authHandler(c *gin.Context) {
-
-	var req AuthRequest
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-
-		c.JSON(400, gin.H{
-			"error": err.Error(),
-		})
-
-		return
-	}
-
-	jsonData, _ := json.Marshal(req)
-
-	status, body, err := proxyRequest(
-		"POST",
-		baseURL+"/auth",
-		jsonData,
-		"",
-	)
-
-	if err != nil {
-
-		c.JSON(500, gin.H{
-			"error": err.Error(),
-		})
-
-		return
-	}
-
-	var authResp AuthResponse
-
-	if err := json.Unmarshal(body, &authResp); err == nil &&
-		authResp.AccessToken != "" {
-
-		setToken(authResp.AccessToken)
-
-		log.Println("TOKEN SAVED")
-
-		c.JSON(status, authResp)
-
-	} else {
-
-		c.Data(status, "application/json", body)
-	}
-}
-
-// ---------------- GENERATE NOTIFICATIONS ----------------
-
-func generateNotificationsHandler(c *gin.Context) {
-
-	tok := getToken()
-
-	if tok == "" {
-
-		c.JSON(401, gin.H{
-			"error": "authenticate first",
-		})
-
-		return
-	}
-
-	req, err := http.NewRequest(
-		"GET",
-		plannerURL,
-		nil,
-	)
-
-	if err != nil {
-
-		c.JSON(500, gin.H{
-			"error": err.Error(),
-		})
-
-		return
-	}
+if token != "" {
 
 	req.Header.Set(
 		"Authorization",
-		"Bearer "+tok,
+		"Bearer "+token,
 	)
+}
 
-	resp, err := httpClient.Do(req)
+resp, err := apiClient.Do(req)
 
-	if err != nil {
+if err != nil {
+	return 0, nil, err
+}
 
-		c.JSON(500, gin.H{
-			"error": err.Error(),
-		})
+defer resp.Body.Close()
 
-		return
-	}
+respBody, _ := io.ReadAll(resp.Body)
 
-	defer resp.Body.Close()
+return resp.StatusCode, respBody, nil
 
-	body, _ := io.ReadAll(resp.Body)
+}
 
-	var plan PlanResponse
+// random helper
+func newID() string {
+return uuid.New().String()
+}
 
-	if err := json.Unmarshal(body, &plan); err != nil {
+// ---------------------------------------------------
+// auth
+// ---------------------------------------------------
 
-		c.JSON(500, gin.H{
-			"error": "failed to parse planner response",
-		})
+func authHandler(ctx *gin.Context) {
 
-		return
-	}
+var req AuthReq
 
-	notifMu.Lock()
+if err := ctx.ShouldBindJSON(&req); err != nil {
 
-	newNotifications := []Notification{}
-
-	for _, result := range plan.Results {
-
-		n := Notification{
-			ID:        generateID(),
-			Type:      "Result",
-			Message:   formatMessage(result),
-			Timestamp: time.Now().Format("2006-01-02 15:04:05"),
-		}
-
-		notifications = append(notifications, n)
-		newNotifications = append(newNotifications, n)
-	}
-
-	notifMu.Unlock()
-
-	go sendLog(
-		"backend",
-		"info",
-		"notifications",
-		"Notifications generated",
-	)
-
-	c.JSON(200, gin.H{
-		"notifications": newNotifications,
+	ctx.JSON(400, gin.H{
+		"error": err.Error(),
 	})
+
+	return
 }
 
-// ---------------- GET NOTIFICATIONS ----------------
+jsonBody, _ := json.Marshal(req)
 
-func getNotificationsHandler(c *gin.Context) {
+status, response, err := makeRequest(
+	"POST",
+	apiBase+"/auth",
+	jsonBody,
+	"",
+)
 
-	notifMu.RLock()
+if err != nil {
 
-	defer notifMu.RUnlock()
+	log.Println("auth failed:", err)
 
-	c.JSON(200, gin.H{
-		"notifications": notifications,
+	ctx.JSON(500, gin.H{
+		"error": "auth failed",
 	})
+
+	return
 }
 
-// ---------------- CLEAR NOTIFICATIONS ----------------
+var authData AuthResp
 
-func clearNotificationsHandler(c *gin.Context) {
+if json.Unmarshal(response, &authData) == nil &&
+	authData.Token != "" {
 
-	notifMu.Lock()
+	updateToken(authData.Token)
 
-	notifications = []Notification{}
+	log.Println("token stored")
 
-	notifMu.Unlock()
+	ctx.JSON(status, authData)
 
-	c.JSON(200, gin.H{
-		"message": "notifications cleared",
+} else {
+
+	// fallback if external api changes shape
+	ctx.Data(status, "application/json", response)
+}
+
+}
+
+// ---------------------------------------------------
+// generate notifications
+// ---------------------------------------------------
+
+func generateNotificationsHandler(ctx *gin.Context) {
+
+token := fetchToken()
+
+if token == "" {
+
+	ctx.JSON(401, gin.H{
+		"error": "authenticate first",
 	})
+
+	return
 }
 
-// ---------------- MESSAGE FORMATTER ----------------
+req, err := http.NewRequest(
+	"GET",
+	planApi,
+	nil,
+)
 
-func formatMessage(r DepotResult) string {
+if err != nil {
 
-	return "Depot " + r.DepotID +
-		" scheduled with impact score " +
-		itoa(r.MaxImpactScore)
+	ctx.JSON(500, gin.H{
+		"error": err.Error(),
+	})
+
+	return
 }
 
-// ---------------- INTEGER TO STRING ----------------
+req.Header.Set(
+	"Authorization",
+	"Bearer "+token,
+)
 
-func itoa(n int) string {
+resp, err := apiClient.Do(req)
 
-	if n == 0 {
-		return "0"
+if err != nil {
+
+	ctx.JSON(500, gin.H{
+		"error": err.Error(),
+	})
+
+	return
+}
+
+defer resp.Body.Close()
+
+body, _ := io.ReadAll(resp.Body)
+
+var planner PlannerResp
+
+if err := json.Unmarshal(body, &planner); err != nil {
+
+	log.Println("planner parse issue:", err)
+
+	ctx.JSON(500, gin.H{
+		"error": "bad planner response",
+	})
+
+	return
+}
+
+notifLock.Lock()
+
+tempNotifications := []Notification{}
+
+for _, depot := range planner.Results {
+
+	item := Notification{
+		ID:        newID(),
+		Type:      "Result",
+		Message:   buildMessage(depot),
+		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
 	}
 
-	result := ""
-
-	for n > 0 {
-
-		result = string(rune('0'+n%10)) + result
-
-		n /= 10
-	}
-
-	return result
+	allNotifications = append(allNotifications, item)
+	tempNotifications = append(tempNotifications, item)
 }
 
-// ---------------- SEND LOG ----------------
+notifLock.Unlock()
 
-func sendLog(
-	stack string,
-	level string,
-	pkg string,
-	message string,
+go sendLogs(
+	"backend",
+	"info",
+	"notifications",
+	"notifications created",
+)
+
+ctx.JSON(200, gin.H{
+	"notifications": tempNotifications,
+})
+
+}
+
+// ---------------------------------------------------
+// fetch notifications
+// ---------------------------------------------------
+
+func getNotificationsHandler(ctx *gin.Context) {
+
+notifLock.RLock()
+defer notifLock.RUnlock()
+
+ctx.JSON(200, gin.H{
+	"notifications": allNotifications,
+})
+
+}
+
+// ---------------------------------------------------
+// clear notifications
+// ---------------------------------------------------
+
+func clearNotificationsHandler(ctx *gin.Context) {
+
+notifLock.Lock()
+
+// easiest reset
+allNotifications = []Notification{}
+
+notifLock.Unlock()
+
+ctx.JSON(200, gin.H{
+	"message": "notifications cleared",
+})
+
+}
+
+// ---------------------------------------------------
+// formatter
+// ---------------------------------------------------
+
+func buildMessage(d DepotData) string {
+
+// maybe improve wording later
+return "Depot " + d.DepotID +
+	" scheduled with impact score " +
+	intToString(d.MaxScore)
+
+}
+
+// ---------------------------------------------------
+// homemade int to string lol
+// strconv.Itoa exists but keeping this for fun
+// ---------------------------------------------------
+
+func intToString(n int) string {
+
+if n == 0 {
+	return "0"
+}
+
+output := ""
+
+for n > 0 {
+
+	lastDigit := n % 10
+
+	output = string(rune('0'+lastDigit)) + output
+
+	n = n / 10
+}
+
+return output
+
+}
+
+// ---------------------------------------------------
+// logging service
+// ---------------------------------------------------
+
+func sendLogs(
+stack string,
+level string,
+pkg string,
+msg string,
 ) {
 
-	tok := getToken()
+token := fetchToken()
 
-	if tok == "" {
-		return
-	}
-
-	payload := LogPayload{
-		Stack:   stack,
-		Level:   level,
-		Package: pkg,
-		Message: message,
-	}
-
-	jsonData, _ := json.Marshal(payload)
-
-	status, body, err := proxyRequest(
-		"POST",
-		baseURL+"/logs",
-		jsonData,
-		tok,
-	)
-
-	if err != nil {
-
-		log.Println("LOG ERROR:", err)
-
-		return
-	}
-
-	log.Printf(
-		"LOG RESPONSE [%d]: %s",
-		status,
-		string(body),
-	)
+if token == "" {
+	log.Println("token missing, skipping logs")
+	return
 }
 
-// ---------------- MAIN ----------------
+payload := LogReq{
+	Stack:   stack,
+	Level:   level,
+	Package: pkg,
+	Message: msg,
+}
+
+jsonBody, _ := json.Marshal(payload)
+
+status, body, err := makeRequest(
+	"POST",
+	apiBase+"/logs",
+	jsonBody,
+	token,
+)
+
+if err != nil {
+
+	log.Println("failed sending logs:", err)
+
+	return
+}
+
+log.Printf("log response [%d]", status)
+
+if len(body) > 0 {
+	log.Println(string(body))
+}
+
+}
+
+// ---------------------------------------------------
+// main
+// ---------------------------------------------------
 
 func main() {
 
-	r := gin.Default()
+router := gin.Default()
 
-	r.Use(LoggingMiddleware())
+router.Use(RequestLogger())
 
-	// AUTH
-	r.POST("/auth", authHandler)
+// auth
+router.POST("/auth", authHandler)
 
-	// NOTIFICATIONS
-	r.POST(
-		"/notifications/generate",
-		generateNotificationsHandler,
-	)
+// notification routes
+router.POST(
+	"/notifications/generate",
+	generateNotificationsHandler,
+)
 
-	r.GET(
-		"/notifications",
-		getNotificationsHandler,
-	)
+router.GET(
+	"/notifications",
+	getNotificationsHandler,
+)
 
-	r.DELETE(
-		"/notifications",
-		clearNotificationsHandler,
-	)
+router.DELETE(
+	"/notifications",
+	clearNotificationsHandler,
+)
 
-	log.Println(
-		"🚀 Notification System running on :8080",
-	)
+log.Println("notification system running on :8080")
 
-	r.Run(":8080")
+router.Run(":8080")
+
 }
